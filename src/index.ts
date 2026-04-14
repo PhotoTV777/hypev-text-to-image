@@ -1,8 +1,21 @@
-const MODELS = [
-	{ id: "@cf/stabilityai/stable-diffusion-xl-base-1.0", label: "Stable Diffusion XL" },
-	{ id: "@cf/bytedance/stable-diffusion-xl-lightning", label: "SDXL Lightning (Fast)" },
-	{ id: "@cf/lykon/dreamshaper-8-lcm", label: "DreamShaper 8 LCM" },
-	{ id: "@cf/runwayml/stable-diffusion-v1-5-inpainting", label: "Stable Diffusion 1.5" },
+type ModelType = "stream" | "base64json" | "multipart";
+
+const MODELS: { id: string; label: string; type: ModelType; badge?: string }[] = [
+	// ── FLUX.2 (Partner, multipart FormData → base64 JSON) ──────────────────
+	{ id: "@cf/black-forest-labs/flux-2-klein-9b", label: "FLUX.2 Klein 9B", type: "multipart", badge: "Partner · Najlepszy" },
+	{ id: "@cf/black-forest-labs/flux-2-klein-4b", label: "FLUX.2 Klein 4B", type: "multipart", badge: "Partner · Szybki" },
+	{ id: "@cf/black-forest-labs/flux-2-dev",       label: "FLUX.2 Dev",      type: "multipart", badge: "Partner" },
+	// ── FLUX.1 (standard → binary stream) ───────────────────────────────────
+	{ id: "@cf/black-forest-labs/flux-1-schnell",   label: "FLUX.1 Schnell",  type: "stream" },
+	// ── Leonardo (Partner, standard → binary JPG stream) ────────────────────
+	{ id: "@cf/leonardo/phoenix-1.0",   label: "Leonardo Phoenix 1.0", type: "stream",    badge: "Partner" },
+	// ── Leonardo (Partner, standard → base64 JSON) ──────────────────────────
+	{ id: "@cf/leonardo/lucid-origin",  label: "Leonardo Lucid Origin", type: "base64json", badge: "Partner" },
+	// ── Stability / Byte Dance / Lykon (standard → binary PNG stream) ────────
+	{ id: "@cf/stabilityai/stable-diffusion-xl-base-1.0", label: "Stable Diffusion XL",      type: "stream" },
+	{ id: "@cf/bytedance/stable-diffusion-xl-lightning",   label: "SDXL Lightning",           type: "stream", badge: "Szybki" },
+	{ id: "@cf/lykon/dreamshaper-8-lcm",                   label: "DreamShaper 8 LCM",        type: "stream" },
+	{ id: "@cf/runwayml/stable-diffusion-v1-5-inpainting", label: "Stable Diffusion 1.5",     type: "stream" },
 ];
 
 const HTML = `<!DOCTYPE html>
@@ -268,7 +281,7 @@ const HTML = `<!DOCTYPE html>
       <div class="field">
         <label for="model">Model AI</label>
         <select id="model">
-          ${MODELS.map(m => `<option value="${m.id}">${m.label}</option>`).join("\n          ")}
+          ${MODELS.map(m => `<option value="${m.id}">${m.label}${m.badge ? ` [${m.badge}]` : ""}</option>`).join("\n          ")}
         </select>
       </div>
       <div class="field">
@@ -396,7 +409,7 @@ export default {
 
 		// Image generation API
 		if (request.method === "POST" && url.pathname === "/api/generate") {
-			let body: { prompt?: string; model?: string; steps?: number };
+			let body: { prompt?: string; model?: string; steps?: number; width?: number; height?: number };
 			try {
 				body = await request.json();
 			} catch {
@@ -408,16 +421,43 @@ export default {
 				return Response.json({ error: "Prompt is required" }, { status: 400 });
 			}
 
-			const model = MODELS.some(m => m.id === body.model)
-				? body.model!
-				: MODELS[0].id;
-
+			const modelMeta = MODELS.find(m => m.id === body.model) ?? MODELS[0];
+			const modelId = modelMeta.id;
 			const steps = Math.min(Math.max(Number(body.steps) || 20, 1), 50);
+			const width  = Math.min(Math.max(Number(body.width)  || 1024, 256), 2048);
+			const height = Math.min(Math.max(Number(body.height) || 1024, 256), 2048);
 
 			try {
-				const response = await (env.AI as any).run(model, { prompt, num_steps: steps });
+				const ai = env.AI as any;
+
+				if (modelMeta.type === "multipart") {
+					// FLUX.2 models use multipart FormData and return { image: base64 }
+					const form = new FormData();
+					form.append("prompt", prompt);
+					form.append("width", String(width));
+					form.append("height", String(height));
+					const formResponse = new Response(form);
+					const formStream = formResponse.body!;
+					const formContentType = formResponse.headers.get("content-type")!;
+					const result = await ai.run(modelId, { multipart: { body: formStream, contentType: formContentType } });
+					const base64 = result?.image as string;
+					const binary = Uint8Array.from(atob(base64), c => c.charCodeAt(0));
+					return new Response(binary, { headers: { "content-type": "image/jpeg" } });
+				}
+
+				if (modelMeta.type === "base64json") {
+					// lucid-origin returns { image: base64 }
+					const result = await ai.run(modelId, { prompt, num_steps: steps });
+					const base64 = result?.image as string;
+					const binary = Uint8Array.from(atob(base64), c => c.charCodeAt(0));
+					return new Response(binary, { headers: { "content-type": "image/jpeg" } });
+				}
+
+				// Default: standard models return a ReadableStream (PNG or JPG)
+				const isJpg = modelId.includes("phoenix") || modelId.includes("leonardo");
+				const response = await ai.run(modelId, { prompt, num_steps: steps });
 				return new Response(response, {
-					headers: { "content-type": "image/png" },
+					headers: { "content-type": isJpg ? "image/jpeg" : "image/png" },
 				});
 			} catch (err: any) {
 				const msg = err?.message ?? "AI generation failed";
